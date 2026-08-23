@@ -1,0 +1,129 @@
+#include "arena.h"
+#include "platform.h"
+
+thread_local static mem_arena_t* _scratch_arenas[2] = { NULL, NULL };
+
+mem_arena_t* arena_create(u64 reserve_size, u64 commit_size) {
+    if (commit_size > reserve_size)
+        return NULL;
+
+    u32 page_size = plat_get_pagesize();
+
+    reserve_size = ALIGN_UP_POW2(reserve_size, page_size);
+    commit_size = ALIGN_UP_POW2(commit_size, page_size);
+
+    mem_arena_t* arena = plat_mem_reserve(reserve_size);
+
+    if(!plat_mem_commit(arena, commit_size)) {
+        plat_mem_release(arena, reserve_size);
+        return NULL;
+    }
+
+    arena->reserve_size = reserve_size;
+    arena->commit_size = commit_size;
+    arena->pos = ARENA_BASE_POS;
+    arena->commit_pos = commit_size;
+
+    return arena;
+}
+
+void arena_destroy(mem_arena_t* arena) {
+    plat_mem_release(arena, arena->reserve_size);
+}
+
+void* arena_push(mem_arena_t* arena, u64 size, b32 non_zero) {
+    u64 pos_aligned = ALIGN_UP_POW2(arena->pos, ARENA_ALIGN);
+    u64 new_pos = pos_aligned + size;
+
+    if (new_pos > arena->reserve_size) 
+        return NULL;
+
+    if (new_pos > arena->commit_pos) {
+        u64 new_commit_pos = new_pos;
+        new_commit_pos += arena->commit_size - 1;
+        new_commit_pos -= new_commit_pos % arena->commit_size;
+        new_commit_pos = MIN(new_commit_pos, arena->reserve_size);
+    
+        u8* mem = (u8*)arena + arena->commit_pos;
+        u64 commit_size = new_commit_pos - arena->commit_pos;
+
+        if (!plat_mem_commit(mem, commit_size)) 
+            return NULL;
+
+        arena->commit_pos = new_commit_pos;
+    }
+
+    arena->pos = new_pos;
+
+    u8* out = (u8*)arena + pos_aligned;
+
+    if(!non_zero) {
+        memset(out, 0, size);
+    }
+
+    return out;
+}
+
+void arena_pop(mem_arena_t* arena, u64 size) {
+    size = MIN(size, arena->pos - ARENA_BASE_POS);
+    arena->pos -= size;
+}
+
+void arena_pop_to(mem_arena_t* arena, u64 pos) {
+    u64 size = pos < arena->pos ? arena->pos - pos : 0;
+    arena_pop(arena, size);
+}
+
+void arena_clear(mem_arena_t* arena) {
+    arena_pop_to(arena, ARENA_BASE_POS);
+}
+
+mem_arena_temp_t arena_temp_begin(mem_arena_t* arena) {
+    return (mem_arena_temp_t) {
+        .arena = arena,
+        .start_pos = arena->pos
+    };
+}
+
+void arena_temp_end(mem_arena_temp_t temp) {
+    arena_pop_to(temp.arena, temp.start_pos);
+}
+
+mem_arena_temp_t arena_scratch_get(mem_arena_t** conflicts, u32 num_conflicts) {
+    i32 scratch_index = -1;
+
+    for (i32 i =0; i < 2; i++) {
+        b32 conflict_found = false;
+
+        for (u32 j = 0; j < num_conflicts; j++) {
+            if (_scratch_arenas[i] == conflicts[j]) {
+                conflict_found = true;
+                break;
+            }
+        }
+
+        if (!conflict_found) {
+            scratch_index = i;
+            break;
+        }
+    }
+
+    if (scratch_index == -1) {
+        return (mem_arena_temp_t) { 0 };
+    }
+
+    mem_arena_t** selected = &_scratch_arenas[scratch_index];
+
+    if (*selected == NULL) {
+        *selected = arena_create(MiB(64), MiB(1));
+
+        if(*selected == NULL)
+            return (mem_arena_temp_t) { 0 };
+    }
+
+    return arena_temp_begin(*selected);
+}
+
+void arena_scratch_release(mem_arena_temp_t scratch) {
+    arena_temp_end(scratch);
+}
